@@ -28,6 +28,7 @@ import com.fancy.taxiagent.mapper.TicketMapper;
 import com.fancy.taxiagent.mapper.UserAuthMapper;
 import com.fancy.taxiagent.security.UserTokenContext;
 import com.fancy.taxiagent.service.TicketService;
+import com.fancy.taxiagent.service.base.DelayedCacheEvictor;
 import com.fancy.taxiagent.util.RedisScripts;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -38,6 +39,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -62,6 +64,7 @@ public class TicketServiceImpl implements TicketService {
     private final UserAuthMapper userAuthMapper;
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
+    private final DelayedCacheEvictor delayedCacheEvictor;
 
     // Redis key prefix for ticket no generation
     private static final String TICKET_NO_PREFIX = "ticket:no:";
@@ -71,6 +74,15 @@ public class TicketServiceImpl implements TicketService {
     private static final long TICKET_STATS_LOCK_SECONDS = 5L;
     private static final long TICKET_STATS_LOCK_WAIT_MILLIS = 60L;
     private static final int TICKET_STATS_LOCK_RETRY_TIMES = 3;
+
+    /**
+     * 延迟双删的第二次删除延迟
+     * <p>
+     * 取值需覆盖"读线程查 DB + 回填缓存"的耗时，否则第二次删除仍早于回填，竞态依旧存在。
+     * 统计查询是 4 次 selectCount，实测在几十毫秒量级，取 500ms 留足余量。
+     * 延迟过长只会多几次缓存未命中，不会造成脏数据，故宁可取大。
+     */
+    private static final Duration TICKET_STATS_DELAYED_EVICT = Duration.ofMillis(500);
 
     // ============ C端接口实现 ============
 
@@ -1064,33 +1076,46 @@ public class TicketServiceImpl implements TicketService {
     }
 
     /**
-     * 失效工单统计缓存（当日 key）
+     * 失效工单统计缓存（当日 key，延迟双删）
      * <p>
      * 任何对工单表的写入都必须调用本方法，否则统计接口会一直返回写入前的旧值。
      * <p>
-     * 两个设计要点：
+     * 三个设计要点：
      * <ol>
      *   <li><b>提交后失效</b>：若在事务内删除缓存，并发读会拿到"尚未提交的 DB 快照"并回填，
      *       制造出比目标竞态更早、更容易触发的脏数据窗口。故挂到 afterCommit。</li>
+     *   <li><b>延迟双删</b>：第一次删除之后，可能仍有读线程手持旧快照把脏值写回缓存
+     *       （时序图见 {@link DelayedCacheEvictor} 类注释），故补一次延迟删除兜住该窗口。</li>
      *   <li><b>保守失效</b>：不区分本次写入是否真的影响那 4 个统计项，一律失效。
      *       统计接口面向 B 端仪表盘，多几次缓存重建的代价远低于漏失效导致的数据错误。</li>
      * </ol>
      */
     private void evictTicketStatistics() {
+        afterCommit(() -> {
+            String cacheKey = RedisKeyConstants.ticketStatisticsKey(LocalDate.now());
+            // 第一次删除：立即失效
+            stringRedisTemplate.delete(cacheKey);
+            // 第二次删除：延迟执行，兜住"并发读基于旧快照回填"的窗口。
+            // 注意此处是在提交后调度，因此延迟窗口从"DB 已可见"开始计，语义正确。
+            delayedCacheEvictor.evictAfter(cacheKey, TICKET_STATS_DELAYED_EVICT);
+            log.debug("工单统计缓存已失效(双删): key={}", cacheKey);
+        });
+    }
+
+    /**
+     * 在事务提交后执行给定动作；当前无事务时立即执行
+     */
+    private void afterCommit(Runnable action) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    deleteTicketStatisticsKey();
+                    action.run();
                 }
             });
         } else {
-            deleteTicketStatisticsKey();
+            action.run();
         }
-    }
-
-    private void deleteTicketStatisticsKey() {
-        stringRedisTemplate.delete(RedisKeyConstants.ticketStatisticsKey(LocalDate.now()));
     }
 
     /**
