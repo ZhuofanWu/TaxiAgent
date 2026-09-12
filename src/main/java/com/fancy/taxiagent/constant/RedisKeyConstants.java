@@ -61,6 +61,18 @@ public final class RedisKeyConstants {
     public static final String CHAT_HISTORY_KEY = "chat:history:";
 
     /**
+     * 聊天历史版本号 Key 前缀（Lease 令牌机制）
+     * 完整格式: chat:history:version:{chatId}
+     */
+    public static final String CHAT_HISTORY_VERSION_PREFIX = "chat:history:version:";
+
+    /**
+     * 聊天历史回填暂存 Key 前缀
+     * 完整格式: chat:history:staging:{chatId}:{token}
+     */
+    public static final String CHAT_HISTORY_STAGING_PREFIX = "chat:history:staging:";
+
+    /**
      * 工具调用结果缓存 Key 前缀
      * 完整格式: tool:{callId}
      */
@@ -143,6 +155,20 @@ public final class RedisKeyConstants {
      */
     public static String chatHistoryKey(String chatId) {
         return CHAT_HISTORY_KEY + chatId;
+    }
+
+    /**
+     * 构建聊天历史版本号 Key
+     */
+    public static String chatHistoryVersionKey(String chatId) {
+        return CHAT_HISTORY_VERSION_PREFIX + chatId;
+    }
+
+    /**
+     * 构建聊天历史回填暂存 Key
+     */
+    public static String chatHistoryStagingKey(String chatId, String token) {
+        return CHAT_HISTORY_STAGING_PREFIX + chatId + ":" + token;
     }
 
     /**
