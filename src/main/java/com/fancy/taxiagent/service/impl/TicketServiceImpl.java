@@ -29,7 +29,7 @@ import com.fancy.taxiagent.mapper.UserAuthMapper;
 import com.fancy.taxiagent.security.UserTokenContext;
 import com.fancy.taxiagent.service.TicketService;
 import com.fancy.taxiagent.service.base.DelayedCacheEvictor;
-import com.fancy.taxiagent.util.RedisScripts;
+import com.fancy.taxiagent.service.base.RedisLock;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -44,7 +44,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -65,6 +64,7 @@ public class TicketServiceImpl implements TicketService {
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
     private final DelayedCacheEvictor delayedCacheEvictor;
+    private final RedisLock redisLock;
 
     // Redis key prefix for ticket no generation
     private static final String TICKET_NO_PREFIX = "ticket:no:";
@@ -1120,29 +1120,25 @@ public class TicketServiceImpl implements TicketService {
 
     /**
      * 尝试获取工单统计缓存重建锁
+     * <p>
+     * 加锁与解锁的细节（令牌校验、原子删除）已收拢到 {@link RedisLock}，
+     * 此处只关心临界区本身。
      *
      * @param lockKey 锁 key
      * @return 加锁成功返回本次持有的唯一令牌；加锁失败返回 null
      */
     private String tryLockTicketStatistics(String lockKey) {
-        String token = UUID.randomUUID().toString();
-        Boolean locked = stringRedisTemplate.opsForValue()
-                .setIfAbsent(lockKey, token, TICKET_STATS_LOCK_SECONDS, TimeUnit.SECONDS);
-        return Boolean.TRUE.equals(locked) ? token : null;
+        return redisLock.tryLock(lockKey, Duration.ofSeconds(TICKET_STATS_LOCK_SECONDS));
     }
 
     /**
-     * 释放工单统计缓存重建锁（校验持有者后删除）
-     * <p>
-     * 竞态场景：本线程的锁因业务耗时超过 {@link #TICKET_STATS_LOCK_SECONDS} 自动过期，
-     * 其他线程随即拿到锁；若此处直接 DEL，会误删他人的锁。
-     * 故先用令牌比对确认锁仍属于自己，再用 Lua 原子删除。
+     * 释放工单统计缓存重建锁
      *
      * @param lockKey 锁 key
      * @param token   加锁时写入的唯一令牌
      */
     private void releaseTicketStatisticsLock(String lockKey, String token) {
-        stringRedisTemplate.execute(RedisScripts.RELEASE_LOCK_IF_MATCH, List.of(lockKey), token);
+        redisLock.unlock(lockKey, token);
     }
 
     private void sleepQuietly(long millis) {

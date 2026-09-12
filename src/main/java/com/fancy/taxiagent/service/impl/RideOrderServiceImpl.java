@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fancy.taxiagent.agentbase.amap.service.AmapGeoRegeoService;
 import com.fancy.taxiagent.agentbase.amap.service.AmapRouteService;
 import com.fancy.taxiagent.config.RideOrderTimeoutProperties;
+import com.fancy.taxiagent.constant.RedisKeyConstants;
 import com.fancy.taxiagent.domain.dto.CreateOrderDTO;
 import com.fancy.taxiagent.domain.entity.OrderRoute;
 import com.fancy.taxiagent.security.UserTokenContext;
@@ -26,6 +27,8 @@ import com.fancy.taxiagent.service.RideOrderService;
 import com.fancy.taxiagent.util.SnowflakeIdWorker;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -37,6 +40,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 @Service
 @RequiredArgsConstructor
@@ -50,7 +55,26 @@ public class RideOrderServiceImpl implements RideOrderService {
     private final OrderGrabService orderGrabService;
     private final OrderDelayQueue orderDelayQueue;
     private final RideOrderTimeoutProperties timeoutProperties;
+    private final RedissonClient redissonClient;
     private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
+
+    /**
+     * 获取订单状态机锁的最长等待时长（秒）
+     * <p>
+     * 状态流转是毫秒级操作，等待时间只需覆盖"恰好有另一个请求正在处理同一订单"。
+     * 取小值是为了让排队失败的请求尽快拿到明确回复，而不是长时间挂起。
+     */
+    private static final long ORDER_LOCK_WAIT_SECONDS = 3L;
+
+    /**
+     * 订单状态机锁的租约时长（秒）
+     * <p>
+     * 显式给租约，而不是用 Redisson 默认的看门狗续期：看门狗的意义是"业务没结束就一直续"，
+     * 但它依赖后台线程按时心跳。一旦进程长时间 GC 停顿或线程饥饿，续期失败而业务仍在跑，
+     * 锁会在脚下悄悄易主 —— 失败模式难以复现也难以排查。用一个明确覆盖最坏耗时的租约，
+     * 至少让"锁过期"这件事是可预期的。
+     */
+    private static final long ORDER_LOCK_LEASE_SECONDS = 10L;
 
     @Override
     public PriceEstimateVO estimatePrice(Point startPoint, Point endPoint, Integer vehicleType, Integer isExpedited) {
@@ -290,38 +314,81 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         Long driverIdLong = convertToLong(driverId);
 
-        // 阶段一：Redis 原子预检（订单可抢 + 司机空闲），一次判断代替原先的两次 DB 往返。
-        // 校验与占位在同一次 Lua 中完成，并发请求不存在"双双通过预检"的窗口。
-        OrderGrabService.GrabResult grabResult = orderGrabService.tryGrab(orderId, driverId);
-        if (grabResult != OrderGrabService.GrabResult.SUCCESS) {
-            throw new BusinessException(409, grabFailureMessage(grabResult));
+        return withOrderLock(orderId, () -> {
+            // 阶段一：Redis 原子预检（订单可抢 + 司机空闲），一次判断代替原先的两次 DB 往返。
+            // 校验与占位在同一次 Lua 中完成，并发请求不存在"双双通过预检"的窗口。
+            OrderGrabService.GrabResult grabResult = orderGrabService.tryGrab(orderId, driverId);
+            if (grabResult != OrderGrabService.GrabResult.SUCCESS) {
+                throw new BusinessException(409, grabFailureMessage(grabResult));
+            }
+
+            // 阶段二：DB 乐观锁落库 —— 预检只是加速，DB 才是最终裁决者
+            LocalDateTime now = LocalDateTime.now();
+            int updated = rideOrderMapper.update(null,
+                    new LambdaUpdateWrapper<RideOrder>()
+                            .eq(RideOrder::getOrderId, orderId)
+                            .eq(RideOrder::getIsDeleted, 0)
+                            .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
+                            .isNull(RideOrder::getDriverId)
+                            .set(RideOrder::getDriverId, driverIdLong)
+                            .set(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
+                            .set(RideOrder::getDriverAcceptTime, now)
+                            .set(RideOrder::getUpdateTime, now));
+
+            if (updated <= 0) {
+                // 预检通过但落库失败：缓存态与 DB 不一致（订单已被他人抢走/已取消）。
+                // 必须把 Lua 里占住的司机位还回去，否则该司机会被一个自己没接到的订单锁住。
+                orderGrabService.rollbackGrab(driverId, orderId);
+                orderGrabService.refreshOrderStatus(orderId);
+                return false;
+            }
+
+            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
+            // 覆盖掉"无人接单"的待办，改为盯"司机是否按时到达"
+            orderDelayQueue.schedule(orderId, Duration.ofMinutes(timeoutProperties.getArriveTimeoutMinutes()));
+            return true;
+        });
+    }
+
+    /**
+     * 在同一订单的分布式锁内执行一段状态流转
+     * <p>
+     * <b>加锁保护的是什么</b>：{@code driverAcceptOrder} / {@code driverArriveStart} /
+     * {@code startRide} / {@code finishRide} 都是"读-判-写"多步操作。DB 乐观锁能保证
+     * 最终写入的正确性，但拦不住"两个请求都读到阶段 A、都认为下一步合法"这种情形 ——
+     * 它们会分别发起写入，其中一个失败并把"状态已变化"的用户可见错误抛给司机，
+     * 而实际上这次操作本来就该被拒绝，错误信息也是误导性的。
+     * 加锁把整段读-判-写串行化，让后到的请求排在队尾、看到前一个的结果。
+     * <p>
+     * <b>锁粒度是订单而非司机</b>：跨订单的"一人一单"约束由
+     * {@link OrderGrabService} 的 Lua 原子预检负责，那里才是能同时看见"订单"与"司机"
+     * 两个维度的地方；此处只处理同一订单上的状态竞争。
+     *
+     * @param orderId 订单ID
+     * @param action  临界区内的动作
+     * @return 动作的返回值
+     */
+    private <T> T withOrderLock(String orderId, Supplier<T> action) {
+        RLock lock = redissonClient.getLock(RedisKeyConstants.orderLockKey(orderId));
+        boolean acquired;
+        try {
+            acquired = lock.tryLock(ORDER_LOCK_WAIT_SECONDS, ORDER_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException(409, "系统繁忙，请稍后重试");
         }
-
-        // 阶段二：DB 乐观锁落库 —— 预检只是加速，DB 才是最终裁决者
-        LocalDateTime now = LocalDateTime.now();
-        int updated = rideOrderMapper.update(null,
-                new LambdaUpdateWrapper<RideOrder>()
-                        .eq(RideOrder::getOrderId, orderId)
-                        .eq(RideOrder::getIsDeleted, 0)
-                        .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
-                        .isNull(RideOrder::getDriverId)
-                        .set(RideOrder::getDriverId, driverIdLong)
-                        .set(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
-                        .set(RideOrder::getDriverAcceptTime, now)
-                        .set(RideOrder::getUpdateTime, now));
-
-        if (updated <= 0) {
-            // 预检通过但落库失败：缓存态与 DB 不一致（订单已被他人抢走/已取消）。
-            // 必须把 Lua 里占住的司机位还回去，否则该司机会被一个自己没接到的订单锁住。
-            orderGrabService.rollbackGrab(driverId, orderId);
-            orderGrabService.refreshOrderStatus(orderId);
-            return false;
+        if (!acquired) {
+            // 等待超时：说明另一个请求正在处理这一单。返回可重试的语义，
+            // 而不是让它去和 DB 乐观锁硬碰、拿回一个"状态已变化"的误导性报错
+            throw new BusinessException(409, "订单正在处理中，请稍后重试");
         }
-
-        orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
-        // 覆盖掉"无人接单"的待办，改为盯"司机是否按时到达"
-        orderDelayQueue.schedule(orderId, Duration.ofMinutes(timeoutProperties.getArriveTimeoutMinutes()));
-        return true;
+        try {
+            return action.get();
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
     }
 
     /**
@@ -345,23 +412,26 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("driverId不能为空");
         }
 
-        LocalDateTime now = LocalDateTime.now();
-        int updated = rideOrderMapper.update(null,
-                new LambdaUpdateWrapper<RideOrder>()
-                        .eq(RideOrder::getOrderId, orderId)
-                        .eq(RideOrder::getIsDeleted, 0)
-                        .eq(RideOrder::getDriverId, convertToLong(driverId))
-                        .eq(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
-                        .set(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ARRIVED.getCode())
-                        .set(RideOrder::getDriverArriveTime, now)
-                        .set(RideOrder::getUpdateTime, now));
+        Long driverIdLong = convertToLong(driverId);
+        return withOrderLock(orderId, () -> {
+            LocalDateTime now = LocalDateTime.now();
+            int updated = rideOrderMapper.update(null,
+                    new LambdaUpdateWrapper<RideOrder>()
+                            .eq(RideOrder::getOrderId, orderId)
+                            .eq(RideOrder::getIsDeleted, 0)
+                            .eq(RideOrder::getDriverId, driverIdLong)
+                            .eq(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
+                            .set(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ARRIVED.getCode())
+                            .set(RideOrder::getDriverArriveTime, now)
+                            .set(RideOrder::getUpdateTime, now));
 
-        if (updated > 0) {
-            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ARRIVED.getCode());
-            // 司机已到达，"未到达"的兜底失去意义，撤掉待办；此后行程中不再有超时约束
-            orderDelayQueue.cancel(orderId);
-        }
-        return updated > 0;
+            if (updated > 0) {
+                orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ARRIVED.getCode());
+                // 司机已到达，"未到达"的兜底失去意义，撤掉待办；此后行程中不再有超时约束
+                orderDelayQueue.cancel(orderId);
+            }
+            return updated > 0;
+        });
     }
 
     @Override
@@ -373,21 +443,24 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("driverId不能为空");
         }
 
-        LocalDateTime now = LocalDateTime.now();
-        int updated = rideOrderMapper.update(null,
-                new LambdaUpdateWrapper<RideOrder>()
-                        .eq(RideOrder::getOrderId, orderId)
-                        .eq(RideOrder::getIsDeleted, 0)
-                        .eq(RideOrder::getDriverId, convertToLong(driverId))
-                        .eq(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ARRIVED.getCode())
-                        .set(RideOrder::getOrderStatus, RideOrderStatus.IN_TRIP.getCode())
-                        .set(RideOrder::getPickupTime, now)
-                        .set(RideOrder::getUpdateTime, now));
+        Long driverIdLong = convertToLong(driverId);
+        return withOrderLock(orderId, () -> {
+            LocalDateTime now = LocalDateTime.now();
+            int updated = rideOrderMapper.update(null,
+                    new LambdaUpdateWrapper<RideOrder>()
+                            .eq(RideOrder::getOrderId, orderId)
+                            .eq(RideOrder::getIsDeleted, 0)
+                            .eq(RideOrder::getDriverId, driverIdLong)
+                            .eq(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ARRIVED.getCode())
+                            .set(RideOrder::getOrderStatus, RideOrderStatus.IN_TRIP.getCode())
+                            .set(RideOrder::getPickupTime, now)
+                            .set(RideOrder::getUpdateTime, now));
 
-        if (updated > 0) {
-            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.IN_TRIP.getCode());
-        }
-        return updated > 0;
+            if (updated > 0) {
+                orderGrabService.syncOrderStatus(orderId, RideOrderStatus.IN_TRIP.getCode());
+            }
+            return updated > 0;
+        });
     }
 
     @Override
@@ -422,6 +495,15 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("driverId不能为空");
         }
 
+        return withOrderLock(orderId, () -> finishRideUnderLock(
+                orderId, driverId, endLat, endLng, endAddress, realPolyline, arriveTime));
+    }
+
+    /**
+     * {@link #finishRide} 的临界区实现
+     */
+    private OrderBillVO finishRideUnderLock(String orderId, String driverId, BigDecimal endLat, BigDecimal endLng,
+            String endAddress, String realPolyline, LocalDateTime arriveTime) {
         RideOrder order = getRequiredOrder(orderId);
         Long driverIdLong = convertToLong(driverId);
         if (order.getDriverId() == null || !order.getDriverId().equals(driverIdLong)) {
@@ -564,7 +646,16 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("cancelRole不能为空");
         }
         String normalizedReason = normalizeText(cancelReason);
+        // 取消同样属于订单状态机的一环，且它的"读状态 → 校验身份/可取消性 → 计违约金 → 条件更新"
+        // 会与 finishRide 直接竞争：司机在临界窗口内结束行程时，这里的条件更新会静默失败，
+        // 而调用方拿回的仍是一个看似成功的违约金数字。纳入同一把锁即可消除该窗口。
+        return withOrderLock(orderId, () -> cancelOrderUnderLock(orderId, operatorId, cancelRole, normalizedReason));
+    }
 
+    /**
+     * {@link #cancelOrder} 的临界区实现
+     */
+    private String cancelOrderUnderLock(String orderId, String operatorId, Integer cancelRole, String normalizedReason) {
         RideOrder order = getRequiredOrder(orderId);
         Integer status = order.getOrderStatus();
         if (status == null) {

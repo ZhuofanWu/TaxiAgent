@@ -127,6 +127,12 @@ public final class RedisKeyConstants {
      */
     public static final String CHAT_RATE_LIMIT_PREFIX = "chat:ratelimit:";
 
+    /**
+     * 订单状态机分布式锁 Key 前缀
+     * 完整格式: order:lock:{orderId}
+     */
+    public static final String ORDER_LOCK_PREFIX = "order:lock:";
+
     private static final DateTimeFormatter DAY_KEY_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     /**
@@ -261,5 +267,12 @@ public final class RedisKeyConstants {
      */
     public static String chatRateLimitKey(String userId) {
         return CHAT_RATE_LIMIT_PREFIX + userId;
+    }
+
+    /**
+     * 构建订单状态机分布式锁 Key
+     */
+    public static String orderLockKey(String orderId) {
+        return ORDER_LOCK_PREFIX + orderId;
     }
 }
