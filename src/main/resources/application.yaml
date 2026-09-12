@@ -76,6 +76,16 @@ auth:
   email-code-ttl-seconds: 300        # 验证码有效期: 5 分钟
   email-code-cooldown-seconds: 60    # 验证码发送冷却: 60 秒
 
+# 网约车订单配置
+ride-order:
+  timeout:
+    enabled: true
+    accept-timeout-minutes: 15     # 下单后无人接单的超时时间
+    arrive-timeout-minutes: 10     # 司机接单后未到达起点的超时时间
+    pay-timeout-minutes: 30        # 行程结束后未支付的超时时间
+    poll-interval-ms: 5000         # 延迟队列扫描间隔
+    batch-size: 100                # 单次扫描最多处理的任务数
+
 amap:
   url: https://restapi.amap.com/v3
   key: your-amap-api-key

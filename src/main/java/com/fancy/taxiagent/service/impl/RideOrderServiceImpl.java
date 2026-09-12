@@ -4,9 +4,11 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fancy.taxiagent.agentbase.amap.service.AmapGeoRegeoService;
 import com.fancy.taxiagent.agentbase.amap.service.AmapRouteService;
+import com.fancy.taxiagent.config.RideOrderTimeoutProperties;
 import com.fancy.taxiagent.domain.dto.CreateOrderDTO;
 import com.fancy.taxiagent.domain.entity.OrderRoute;
 import com.fancy.taxiagent.security.UserTokenContext;
+import com.fancy.taxiagent.service.base.OrderDelayQueue;
 import com.fancy.taxiagent.service.base.OrderGrabService;
 import com.fancy.taxiagent.service.base.OrderRouteService;
 import com.fancy.taxiagent.domain.dto.Point;
@@ -28,6 +30,7 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -45,6 +48,8 @@ public class RideOrderServiceImpl implements RideOrderService {
     private final OrderRouteService orderRouteService;
     private final AmapGeoRegeoService amapGeoRegeoService;
     private final OrderGrabService orderGrabService;
+    private final OrderDelayQueue orderDelayQueue;
+    private final RideOrderTimeoutProperties timeoutProperties;
     private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
 
     @Override
@@ -267,8 +272,11 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new BusinessException(500, "订单创建失败");
         }
         // 写透状态缓存：新单落入"待接单"，司机端的抢单预检无需回源 DB 即可判断
-        orderGrabService.syncOrderStatus(order.getOrderId().toString(), RideOrderStatus.CREATED.getCode());
-        return order.getOrderId().toString();
+        String createdOrderId = order.getOrderId().toString();
+        orderGrabService.syncOrderStatus(createdOrderId, RideOrderStatus.CREATED.getCode());
+        // 登记无人接单兜底：到点仍停留在"待接单"就自动取消
+        orderDelayQueue.schedule(createdOrderId, Duration.ofMinutes(timeoutProperties.getAcceptTimeoutMinutes()));
+        return createdOrderId;
     }
 
     @Override
@@ -311,6 +319,8 @@ public class RideOrderServiceImpl implements RideOrderService {
         }
 
         orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
+        // 覆盖掉"无人接单"的待办，改为盯"司机是否按时到达"
+        orderDelayQueue.schedule(orderId, Duration.ofMinutes(timeoutProperties.getArriveTimeoutMinutes()));
         return true;
     }
 
@@ -348,6 +358,8 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         if (updated > 0) {
             orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ARRIVED.getCode());
+            // 司机已到达，"未到达"的兜底失去意义，撤掉待办；此后行程中不再有超时约束
+            orderDelayQueue.cancel(orderId);
         }
         return updated > 0;
     }
@@ -502,6 +514,8 @@ public class RideOrderServiceImpl implements RideOrderService {
         orderGrabService.syncOrderStatus(orderId, RideOrderStatus.FINISHED_WAIT_PAY.getCode());
         // 行程结束即释放司机：待支付订单不再占用司机，与"一人一单"的判定口径保持一致
         orderGrabService.releaseDriver(driverId);
+        // 登记未支付兜底：到点仍未支付则自动关单
+        orderDelayQueue.schedule(orderId, Duration.ofMinutes(timeoutProperties.getPayTimeoutMinutes()));
 
         return OrderBillVO.builder()
                 .orderId(orderId != null ? orderId.toString() : null)
@@ -532,6 +546,8 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         if (updated > 0) {
             orderGrabService.syncOrderStatus(orderId, RideOrderStatus.PAID.getCode());
+            // 已支付，撤掉未支付兜底
+            orderDelayQueue.cancel(orderId);
         }
         return updated > 0;
     }
@@ -622,9 +638,192 @@ public class RideOrderServiceImpl implements RideOrderService {
             if (order.getDriverId() != null) {
                 orderGrabService.releaseDriver(order.getDriverId().toString());
             }
+            // 已进入终态，撤掉待办避免队列堆积无意义条目
+            orderDelayQueue.cancel(orderId);
         }
 
         return cancelFee.toPlainString();
+    }
+
+    /**
+     * 处理一条到期的订单超时任务
+     * <p>
+     * 判定一律以"重新读到的订单状态 + 该状态下的锚点时间"为准，而不是相信入队时
+     * 记下的意图。这样处理滞后、重复触发、以及任务入队后订单又被推进等情况
+     * 都会自然退化为"什么都不做"，无需额外去重。
+     *
+     * @param orderId 订单ID
+     */
+    @Override
+    public void handleTimeoutOrder(String orderId) {
+        if (orderId == null || orderId.isBlank()) {
+            return;
+        }
+        RideOrder order = rideOrderMapper.selectOne(new LambdaQueryWrapper<RideOrder>()
+                .eq(RideOrder::getOrderId, orderId)
+                .eq(RideOrder::getIsDeleted, 0));
+        if (order == null || order.getOrderStatus() == null) {
+            return;
+        }
+
+        RideOrderStatus status;
+        try {
+            status = RideOrderStatus.fromCode(order.getOrderStatus());
+        } catch (IllegalArgumentException e) {
+            log.warn("订单状态非法，跳过超时处理: orderId={}, status={}", orderId, order.getOrderStatus());
+            return;
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        switch (status) {
+            case CREATED -> handleAcceptTimeout(order, now);
+            case DRIVER_ACCEPTED -> handleArriveTimeout(order, now);
+            case FINISHED_WAIT_PAY -> handlePayTimeout(order, now);
+            default -> log.debug("订单状态已前进，无需超时处理: orderId={}, status={}", orderId, status);
+        }
+    }
+
+    /**
+     * 场景一：下单后长时间无人接单 → 系统自动取消
+     * <p>
+     * 锚点取 {@code updateTime} 而非 {@code createTime}：订单被重新放回车池
+     * （见 {@link #handleArriveTimeout}）时会刷新 updateTime，接单倒计时随之重新计起，
+     * 无需额外字段记录"何时回到池中"。
+     */
+    private void handleAcceptTimeout(RideOrder order, LocalDateTime now) {
+        LocalDateTime anchor = order.getUpdateTime() != null ? order.getUpdateTime() : order.getCreateTime();
+        LocalDateTime deadline = plusMinutes(anchor, timeoutProperties.getAcceptTimeoutMinutes());
+        if (deadline == null) {
+            return;
+        }
+        if (now.isBefore(deadline)) {
+            reschedule(order.getOrderId().toString(), deadline, now);
+            return;
+        }
+        log.info("订单超时无人接单，系统自动取消: orderId={}", order.getOrderId());
+        systemCancel(order, RideOrderStatus.CREATED.getCode(),
+                "超时无人接单，系统自动取消");
+    }
+
+    /**
+     * 场景二：司机接单后长时间未到达起点 → 释放订单回池
+     * <p>
+     * 与另外两个场景不同，这里不取消订单，只把订单退回"待接单"并释放司机，
+     * 让其他司机有机会接单 —— 乘客的诉求是打到车，不是被取消。
+     * <p>
+     * 需要说明的是，这个动作本身是可重复的：退回池中后若又被接单且再次超时，
+     * 会再退回一次。它不会形成紧凑循环 —— 每一轮都要消耗一整个到点阈值，
+     * 且每一轮都释放了一名司机并把订单重新暴露给其他人；真正需要"最多退回几次"
+     * 这种硬上限的话，那应当是一个随订单持久化的字段，而不是只存在于 Redis 的计数器
+     * （Redis 一旦被清空，计数器会凭空归零，上限形同虚设）。
+     */
+    private void handleArriveTimeout(RideOrder order, LocalDateTime now) {
+        LocalDateTime deadline = plusMinutes(order.getDriverAcceptTime(), timeoutProperties.getArriveTimeoutMinutes());
+        if (deadline == null) {
+            // 没有接单时间说明订单状态与数据不自洽，撤掉待办避免反复空转
+            orderDelayQueue.cancel(order.getOrderId().toString());
+            return;
+        }
+        if (now.isBefore(deadline)) {
+            reschedule(order.getOrderId().toString(), deadline, now);
+            return;
+        }
+        if (order.getDriverId() == null) {
+            orderDelayQueue.cancel(order.getOrderId().toString());
+            return;
+        }
+
+        int updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
+                .eq(RideOrder::getOrderId, order.getOrderId())
+                .eq(RideOrder::getIsDeleted, 0)
+                .eq(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
+                .eq(RideOrder::getDriverId, order.getDriverId())
+                .set(RideOrder::getDriverId, null)
+                .set(RideOrder::getDriverAcceptTime, null)
+                .set(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
+                .set(RideOrder::getUpdateTime, now));
+        if (updated <= 0) {
+            // 司机在临界窗口内推进了状态（已到达/开始行程），本次无需释放
+            return;
+        }
+
+        String orderIdStr = order.getOrderId().toString();
+        orderGrabService.releaseDriver(order.getDriverId().toString());
+        orderGrabService.syncOrderStatus(orderIdStr, RideOrderStatus.CREATED.getCode());
+        orderDelayQueue.schedule(orderIdStr, Duration.ofMinutes(timeoutProperties.getAcceptTimeoutMinutes()));
+        // TODO 实际部署时应通过推送通道告知司机与乘客；当前项目订单侧尚无通知设施，先落日志
+        log.info("司机超时未到达，订单已退回车池: orderId={}, driverId={}", orderIdStr, order.getDriverId());
+    }
+
+    /**
+     * 场景三：行程结束后长时间未支付 → 系统自动关单
+     * <p>
+     * 保留 {@code realPrice} 等计价字段：账单已经产生，关单只表示本单流程终止，
+     * 金额仍需留在库里供后续对账/申诉使用。
+     */
+    private void handlePayTimeout(RideOrder order, LocalDateTime now) {
+        LocalDateTime deadline = plusMinutes(order.getFinishTime(), timeoutProperties.getPayTimeoutMinutes());
+        if (deadline == null) {
+            orderDelayQueue.cancel(order.getOrderId().toString());
+            return;
+        }
+        if (now.isBefore(deadline)) {
+            reschedule(order.getOrderId().toString(), deadline, now);
+            return;
+        }
+        log.info("订单超时未支付，系统自动关单: orderId={}", order.getOrderId());
+        systemCancel(order, RideOrderStatus.FINISHED_WAIT_PAY.getCode(),
+                "超时未支付，系统自动关单");
+    }
+
+    /**
+     * 系统侧取消订单（cancelRole = 3）
+     * <p>
+     * 带上"期望状态"做条件更新：只有订单仍停留在超时判定所针对的状态时才落地，
+     * 从而与用户的正常操作（支付、主动取消）天然互斥 —— 谁先到达谁生效。
+     *
+     * @param order          超时前的订单快照
+     * @param expectedStatus 期望仍处于的状态码
+     * @param reason         取消原因
+     */
+    private void systemCancel(RideOrder order, int expectedStatus, String reason) {
+        String orderId = order.getOrderId().toString();
+        LocalDateTime now = LocalDateTime.now();
+        int updated = rideOrderMapper.update(null,
+                new LambdaUpdateWrapper<RideOrder>()
+                        .eq(RideOrder::getOrderId, order.getOrderId())
+                        .eq(RideOrder::getIsDeleted, 0)
+                        .eq(RideOrder::getOrderStatus, expectedStatus)
+                        .set(RideOrder::getOrderStatus, RideOrderStatus.CANCELLED.getCode())
+                        .set(RideOrder::getCancelRole, 3)
+                        .set(RideOrder::getCancelReason, reason)
+                        .set(RideOrder::getUpdateTime, now));
+        if (updated <= 0) {
+            // 状态已被其他操作推进，超时任务让位
+            return;
+        }
+
+        orderGrabService.syncOrderStatus(orderId, RideOrderStatus.CANCELLED.getCode());
+        orderDelayQueue.cancel(orderId);
+        if (order.getDriverId() != null) {
+            orderGrabService.releaseDriver(order.getDriverId().toString());
+        }
+    }
+
+    /**
+     * 按分钟偏移计算一个时间点；锚点为空时返回 null
+     */
+    private LocalDateTime plusMinutes(LocalDateTime anchor, long minutes) {
+        return anchor == null ? null : anchor.plusMinutes(minutes);
+    }
+
+    /**
+     * 任务已认领但尚未真正到期时，按正确的到期时间重新入队
+     * <p>
+     * 认领即代表条目已从 ZSet 移除，若不补回，这条待办就永久丢失了。
+     */
+    private void reschedule(String orderId, LocalDateTime deadline, LocalDateTime now) {
+        orderDelayQueue.schedule(orderId, Duration.between(now, deadline));
     }
 
     /**

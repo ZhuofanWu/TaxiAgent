@@ -215,4 +215,17 @@ public interface RideOrderService {
      */
     RideOrderVO getDriverCurrentOrder(String driverId);
 
+    /**
+     * 处理一条到期的订单超时任务
+     * <p>
+     * 由延迟队列的轮询任务调用。方法内部会重新读取订单当前状态，
+     * 只有"仍停留在超时判定所针对的状态、且确实已超过阈值"才会真的处理，
+     * 因此重复调用与过期调用都是安全的。
+     * <p>
+     * 覆盖三种情形：创建后无人接单、司机接单后未到达、行程结束后未支付。
+     *
+     * @param orderId 订单ID
+     */
+    void handleTimeoutOrder(String orderId);
+
 }

@@ -108,6 +108,13 @@ public final class RedisKeyConstants {
      */
     public static final String DRIVER_ACTIVE_PREFIX = "driver:active:";
 
+    /**
+     * 订单超时延迟队列 Key（ZSet，score = 到期时间戳毫秒，member = orderId）
+     * <p>
+     * 该 key 不设过期：它本身就是待办队列，一旦整体过期，队列里的任务会一起消失。
+     */
+    public static final String DELAY_ORDER_TIMEOUT_KEY = "delay:order:timeout";
+
     private static final DateTimeFormatter DAY_KEY_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     /**
