@@ -133,6 +133,26 @@ public final class RedisKeyConstants {
      */
     public static final String ORDER_LOCK_PREFIX = "order:lock:";
 
+    /**
+     * 工单池排序索引 Key 前缀（ZSet）
+     * 完整格式: ticket:pool:{statusCode}
+     */
+    public static final String TICKET_POOL_PREFIX = "ticket:pool:";
+
+    /**
+     * 工单池索引"已预热"标记 Key 前缀
+     * <p>
+     * 之所以需要单独的标记：ZSet 在成员清空后会被 Redis 自动删除，
+     * 于是"这个状态确实没有工单"与"索引还没建起来"在 EXISTS 上无法区分。
+     */
+    public static final String TICKET_POOL_READY_PREFIX = "ticket:pool:ready:";
+
+    /**
+     * 工单池索引重建锁 Key 前缀
+     * 完整格式: ticket:pool:rebuild:lock:{statusCode}
+     */
+    public static final String TICKET_POOL_REBUILD_LOCK_PREFIX = "ticket:pool:rebuild:lock:";
+
     private static final DateTimeFormatter DAY_KEY_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     /**
@@ -274,5 +294,26 @@ public final class RedisKeyConstants {
      */
     public static String orderLockKey(String orderId) {
         return ORDER_LOCK_PREFIX + orderId;
+    }
+
+    /**
+     * 构建工单池排序索引 Key
+     */
+    public static String ticketPoolKey(int statusCode) {
+        return TICKET_POOL_PREFIX + statusCode;
+    }
+
+    /**
+     * 构建工单池索引"已预热"标记 Key
+     */
+    public static String ticketPoolReadyKey(int statusCode) {
+        return TICKET_POOL_READY_PREFIX + statusCode;
+    }
+
+    /**
+     * 构建工单池索引重建锁 Key
+     */
+    public static String ticketPoolRebuildLockKey(int statusCode) {
+        return TICKET_POOL_REBUILD_LOCK_PREFIX + statusCode;
     }
 }

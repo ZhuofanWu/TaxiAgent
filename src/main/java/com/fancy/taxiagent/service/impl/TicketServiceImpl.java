@@ -30,6 +30,7 @@ import com.fancy.taxiagent.security.UserTokenContext;
 import com.fancy.taxiagent.service.TicketService;
 import com.fancy.taxiagent.service.base.DelayedCacheEvictor;
 import com.fancy.taxiagent.service.base.RedisLock;
+import com.fancy.taxiagent.service.base.TicketPoolIndex;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -44,6 +45,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -65,6 +69,7 @@ public class TicketServiceImpl implements TicketService {
     private final ObjectMapper objectMapper;
     private final DelayedCacheEvictor delayedCacheEvictor;
     private final RedisLock redisLock;
+    private final TicketPoolIndex ticketPoolIndex;
 
     // Redis key prefix for ticket no generation
     private static final String TICKET_NO_PREFIX = "ticket:no:";
@@ -147,7 +152,7 @@ public class TicketServiceImpl implements TicketService {
                 .build();
         ticketChatMapper.insert(systemChat);
 
-        evictTicketStatistics();
+        afterTicketMutation(ticketId);
         return ticketId;
     }
 
@@ -191,7 +196,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单关闭成功: ticketId={}, userId={}", ticketId, userId);
-            evictTicketStatistics();
+            afterTicketMutation(ticketId);
         }
 
         return rows > 0;
@@ -242,7 +247,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单确认结单: ticketId={}, satisfied={}", req.getTicketId(), req.getSatisfied());
-            evictTicketStatistics();
+            afterTicketMutation(req.getTicketId());
         }
 
         return rows > 0;
@@ -295,6 +300,79 @@ public class TicketServiceImpl implements TicketService {
      */
     @Override
     public PageResult<TicketVO> getAdminTicketPage(TicketQueryReqDTO req) {
+        // 快路径：只按状态筛选时，直接用好 ZSet 的现成顺序，免掉全表排序
+        if (canUseTicketPoolIndex(req)) {
+            PageResult<TicketVO> indexed = pageByTicketPoolIndex(req);
+            if (indexed != null) {
+                return indexed;
+            }
+            // 索引不可用（冷启动且未抢到重建锁 / Redis 异常）时落到下面的 DB 查询
+        }
+        return pageAdminTicketsFromDb(req);
+    }
+
+    /**
+     * 判断本次查询能否走工单池索引
+     * <p>
+     * 索引只记录"状态 + 优先级 + 更新时间"三个维度，回答不了关键词、工单类型、
+     * 处理人、发起人类型这些需要回表过滤的条件。而且要特别注意：
+     * 这类条件<b>不能</b>用"先按索引取第 N 页、再过滤"来实现 ——
+     * 索引的分页窗口是在全量集合上滑动的，过滤后每页剩下的记录数不可预期，
+     * 页码越靠后越接近空，看起来就像数据丢了。所以这类查询整体交回 DB。
+     */
+    private boolean canUseTicketPoolIndex(TicketQueryReqDTO req) {
+        return req.getStatus() != null
+                && req.getType() == null
+                && req.getUserType() == null
+                && !StringUtils.hasText(req.getHandlerId())
+                && !StringUtils.hasText(req.getKeyword());
+    }
+
+    /**
+     * 走工单池索引查询
+     *
+     * @return 索引可用时返回结果；不可用时返回 null，由调用方退回 DB
+     */
+    private PageResult<TicketVO> pageByTicketPoolIndex(TicketQueryReqDTO req) {
+        int size = (int) req.getSize();
+        int offset = (int) ((req.getCurrent() - 1) * req.getSize());
+        Optional<TicketPoolIndex.PoolSlice> slice = ticketPoolIndex.slice(req.getStatus(), offset, size);
+        if (slice.isEmpty()) {
+            return null;
+        }
+
+        TicketPoolIndex.PoolSlice poolSlice = slice.get();
+        if (poolSlice.ids().isEmpty()) {
+            return PageResult.<TicketVO>builder()
+                    .page((int) req.getCurrent())
+                    .size(size)
+                    .total(poolSlice.total())
+                    .records(List.of())
+                    .build();
+        }
+
+        // 按索引给出的顺序取回实体。selectBatchIds 不保证返回顺序，
+        // 必须按 ids 重新排列，否则分页顺序会随数据库返回顺序漂移。
+        Map<Long, Ticket> byId = ticketMapper.selectBatchIds(poolSlice.ids()).stream()
+                .collect(Collectors.toMap(Ticket::getId, ticket -> ticket, (a, b) -> a));
+        List<TicketVO> records = poolSlice.ids().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .map(this::toVO)
+                .collect(Collectors.toList());
+
+        return PageResult.<TicketVO>builder()
+                .page((int) req.getCurrent())
+                .size(size)
+                .total(poolSlice.total())
+                .records(records)
+                .build();
+    }
+
+    /**
+     * 工单池的 DB 查询（原路径，同时作为索引不可用时的兜底）
+     */
+    private PageResult<TicketVO> pageAdminTicketsFromDb(TicketQueryReqDTO req) {
         Page<Ticket> page = new Page<>(req.getCurrent(), req.getSize());
 
         LambdaQueryWrapper<Ticket> queryWrapper = new LambdaQueryWrapper<>();
@@ -377,7 +455,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单认领成功: ticketId={}, handlerId={}", ticketId, handlerId);
-            evictTicketStatistics();
+            afterTicketMutation(ticketId);
         }
 
         return rows > 0;
@@ -422,7 +500,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单转交成功: ticketId={}, handlerId={}, role={}", ticketId, handlerId, roleDesc);
-            evictTicketStatistics();
+            afterTicketMutation(ticketId);
         }
 
         return rows > 0;
@@ -503,8 +581,8 @@ public class TicketServiceImpl implements TicketService {
                 throw new IllegalArgumentException("未知的操作类型: " + actionType);
         }
 
-        // 四个分支都可能改变工单状态，统一在 switch 之后失效一次
-        evictTicketStatistics();
+        // 四个分支都可能改变工单状态（含优先级之外的状态迁移），统一在 switch 之后收尾一次
+        afterTicketMutation(req.getTicketId());
         return true;
     }
 
@@ -551,7 +629,7 @@ public class TicketServiceImpl implements TicketService {
             }
         }
 
-        evictTicketStatistics();
+        afterTicketMutation(req.getTicketId());
         return true;
     }
 
@@ -873,7 +951,7 @@ public class TicketServiceImpl implements TicketService {
             String systemMsg = String.format("工单已升级为【%s】级别，原因：%s", priorityDesc, reason);
             insertSystemMessage(ticketId, systemMsg);
             log.info("工单升级成功: ticketId={}, targetLevel={}, reason={}", ticketId, targetLevel, reason);
-            evictTicketStatistics();
+            afterTicketMutation(ticketId);
         }
 
         return rows > 0;
@@ -919,7 +997,7 @@ public class TicketServiceImpl implements TicketService {
             String systemMsg = String.format("工单已升级为【%s】级别（由%s操作），原因：%s", priorityDesc, operatorDesc, reason);
             insertSystemMessage(ticketId, systemMsg);
             log.info("工单升级成功（B端）: ticketId={}, targetLevel={}, operatorId={}", ticketId, targetLevel, operatorId);
-            evictTicketStatistics();
+            afterTicketMutation(ticketId);
         }
 
         return rows > 0;
@@ -964,7 +1042,7 @@ public class TicketServiceImpl implements TicketService {
 
         log.info("用户补充工单信息: ticketId={}, userId={}", ticketId, userId);
 
-        evictTicketStatistics();
+        afterTicketMutation(ticketId);
         return true;
     }
 
@@ -1072,6 +1150,25 @@ public class TicketServiceImpl implements TicketService {
             stringRedisTemplate.opsForValue().set(cacheKey, json, ttl, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.warn("工单统计写缓存失败: key={}", cacheKey, e);
+        }
+    }
+
+    /**
+     * 工单写入后的统一收尾
+     * <p>
+     * 把"统计缓存失效"和"工单池索引同步"绑在一起：两者都由工单表的同一批变更触发，
+     * 分成两次调用迟早会有人只写其中一个。任何改动工单的方法都应当调用本方法，
+     * 而不是单独调 {@link #evictTicketStatistics()}。
+     * <p>
+     * 索引同步放在提交后执行：事务回滚时 {@code afterCommit} 根本不触发，
+     * 索引自然停留在写入前的状态，与回滚后的 DB 一致。
+     *
+     * @param ticketId 工单业务编号
+     */
+    private void afterTicketMutation(String ticketId) {
+        evictTicketStatistics();
+        if (StringUtils.hasText(ticketId)) {
+            afterCommit(() -> ticketPoolIndex.syncByTicketId(ticketId));
         }
     }
 
