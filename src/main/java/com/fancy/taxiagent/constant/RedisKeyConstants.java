@@ -115,6 +115,18 @@ public final class RedisKeyConstants {
      */
     public static final String DELAY_ORDER_TIMEOUT_KEY = "delay:order:timeout";
 
+    /**
+     * 对话分类结果缓存 Key 前缀
+     * 完整格式: chat:classify:{上下文指纹}:{prompt指纹}
+     */
+    public static final String CHAT_CLASSIFY_CACHE_PREFIX = "chat:classify:";
+
+    /**
+     * 对话限流 Key 前缀（ZSet 滑动窗口）
+     * 完整格式: chat:ratelimit:{userId}
+     */
+    public static final String CHAT_RATE_LIMIT_PREFIX = "chat:ratelimit:";
+
     private static final DateTimeFormatter DAY_KEY_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     /**
@@ -232,5 +244,22 @@ public final class RedisKeyConstants {
      */
     public static String driverActiveKey(String driverId) {
         return DRIVER_ACTIVE_PREFIX + driverId;
+    }
+
+    /**
+     * 构建对话分类结果缓存 Key
+     *
+     * @param contextFingerprint 上下文指纹（分类所依赖的历史特征）
+     * @param promptFingerprint  用户输入的指纹
+     */
+    public static String chatClassifyKey(String contextFingerprint, String promptFingerprint) {
+        return CHAT_CLASSIFY_CACHE_PREFIX + contextFingerprint + ":" + promptFingerprint;
+    }
+
+    /**
+     * 构建对话限流 Key
+     */
+    public static String chatRateLimitKey(String userId) {
+        return CHAT_RATE_LIMIT_PREFIX + userId;
     }
 }

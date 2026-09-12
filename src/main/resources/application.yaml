@@ -70,6 +70,14 @@ mybatis-plus:
 server:
   port: 8080
 
+# 对话前置守卫配置（分类缓存 + 调用限流）
+chat:
+  guard:
+    classify-cache-ttl-seconds: 21600   # 分类结果缓存 6 小时
+    fingerprint-length: 32              # 缓存 key 中指纹的十六进制长度
+    rate-limit-max: 30                  # 单个用户在窗口内最多发起 30 轮对话
+    rate-limit-window-seconds: 60       # 滑动窗口长度 60 秒
+
 # 认证配置
 auth:
   token-ttl-seconds: 604800          # Token 有效期: 7 天

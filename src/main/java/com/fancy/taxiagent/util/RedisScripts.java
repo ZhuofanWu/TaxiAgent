@@ -154,6 +154,40 @@ public final class RedisScripts {
             return 1
             """, Long.class);
 
+    /**
+     * 滑动窗口限流
+     * <p>
+     * 用 ZSet 记录窗口内的每一次调用，score 为调用时刻（毫秒）。每次先按 score
+     * 区间剔除窗口外的历史记录，再判断窗口内计数是否已达阈值。
+     * <p>
+     * 之所以不用"INCR + EXPIRE"的固定窗口：固定窗口的两端是硬边界，跨边界时
+     * 上一窗口尾部与下一窗口头部可以叠加出 2 倍阈值的瞬时流量。
+     * <p>
+     * 剔除、计数、写入必须在同一个 Lua 内完成，否则并发下会出现
+     * "都读到最后一次计数、都认为没超限"的经典丢失更新。
+     * <p>
+     * KEYS[1] = 限流 ZSet key<br>
+     * ARGV[1] = 当前时间（毫秒）<br>
+     * ARGV[2] = 窗口长度（毫秒）<br>
+     * ARGV[3] = 窗口内允许的最大次数<br>
+     * ARGV[4] = 本次调用的唯一标识（ZSet member）
+     *
+     * @return &gt;=0 = 放行，返回剩余可用次数；-1 = 已超限
+     */
+    public static final RedisScript<Long> SLIDING_WINDOW_RATE_LIMIT = script("""
+            local now = tonumber(ARGV[1])
+            local window = tonumber(ARGV[2])
+            local limit = tonumber(ARGV[3])
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+            local used = redis.call('ZCARD', KEYS[1])
+            if used >= limit then
+                return -1
+            end
+            redis.call('ZADD', KEYS[1], now, ARGV[4])
+            redis.call('PEXPIRE', KEYS[1], window)
+            return limit - used - 1
+            """, Long.class);
+
     private static <T> RedisScript<T> script(String lua, Class<T> resultType) {
         DefaultRedisScript<T> redisScript = new DefaultRedisScript<>();
         redisScript.setScriptText(lua);
