@@ -3,12 +3,14 @@ package com.fancy.taxiagent.agentbase.chatinfo;
 import com.fancy.taxiagent.constant.RedisKeyConstants;
 import com.fancy.taxiagent.domain.vo.RestoreChatVO;
 import com.fancy.taxiagent.service.base.ChatInfoService;
+import com.fancy.taxiagent.util.RedisScripts;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 
 @Component
@@ -24,8 +26,14 @@ public class ChatManager {
     public void lockChat(String chatId){
         chatInfoService.lockChat(chatId);
         String chatInfoKey = RedisKeyConstants.chatInfoKey(chatId);
-        stringRedisTemplate.opsForHash().put(chatInfoKey, "locked", "true");
-        stringRedisTemplate.expire(chatInfoKey, expireLock);
+        // HSET 与 EXPIRE 必须原子执行：若 HSET 成功而 EXPIRE 失败，该 key 将永久留存，
+        // 会话被永久锁死，后续所有请求都会被 isLocked 拦下。
+        stringRedisTemplate.execute(
+                RedisScripts.HASH_SET_WITH_EXPIRE,
+                List.of(chatInfoKey),
+                "locked",
+                "true",
+                String.valueOf(expireLock.toSeconds()));
     }
 
     public void updateChatTime(String chatId){
