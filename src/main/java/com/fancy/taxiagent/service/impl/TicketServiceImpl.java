@@ -34,6 +34,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDate;
@@ -132,6 +134,8 @@ public class TicketServiceImpl implements TicketService {
                 .createdAt(LocalDateTime.now())
                 .build();
         ticketChatMapper.insert(systemChat);
+
+        evictTicketStatistics();
         return ticketId;
     }
 
@@ -175,6 +179,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单关闭成功: ticketId={}, userId={}", ticketId, userId);
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -225,6 +230,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单确认结单: ticketId={}, satisfied={}", req.getTicketId(), req.getSatisfied());
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -359,6 +365,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单认领成功: ticketId={}, handlerId={}", ticketId, handlerId);
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -403,6 +410,7 @@ public class TicketServiceImpl implements TicketService {
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单转交成功: ticketId={}, handlerId={}, role={}", ticketId, handlerId, roleDesc);
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -483,6 +491,8 @@ public class TicketServiceImpl implements TicketService {
                 throw new IllegalArgumentException("未知的操作类型: " + actionType);
         }
 
+        // 四个分支都可能改变工单状态，统一在 switch 之后失效一次
+        evictTicketStatistics();
         return true;
     }
 
@@ -529,6 +539,7 @@ public class TicketServiceImpl implements TicketService {
             }
         }
 
+        evictTicketStatistics();
         return true;
     }
 
@@ -850,6 +861,7 @@ public class TicketServiceImpl implements TicketService {
             String systemMsg = String.format("工单已升级为【%s】级别，原因：%s", priorityDesc, reason);
             insertSystemMessage(ticketId, systemMsg);
             log.info("工单升级成功: ticketId={}, targetLevel={}, reason={}", ticketId, targetLevel, reason);
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -895,6 +907,7 @@ public class TicketServiceImpl implements TicketService {
             String systemMsg = String.format("工单已升级为【%s】级别（由%s操作），原因：%s", priorityDesc, operatorDesc, reason);
             insertSystemMessage(ticketId, systemMsg);
             log.info("工单升级成功（B端）: ticketId={}, targetLevel={}, operatorId={}", ticketId, targetLevel, operatorId);
+            evictTicketStatistics();
         }
 
         return rows > 0;
@@ -938,6 +951,8 @@ public class TicketServiceImpl implements TicketService {
         updateTicketTime(ticketId, LocalDateTime.now());
 
         log.info("用户补充工单信息: ticketId={}, userId={}", ticketId, userId);
+
+        evictTicketStatistics();
         return true;
     }
 
@@ -1046,6 +1061,36 @@ public class TicketServiceImpl implements TicketService {
         } catch (Exception e) {
             log.warn("工单统计写缓存失败: key={}", cacheKey, e);
         }
+    }
+
+    /**
+     * 失效工单统计缓存（当日 key）
+     * <p>
+     * 任何对工单表的写入都必须调用本方法，否则统计接口会一直返回写入前的旧值。
+     * <p>
+     * 两个设计要点：
+     * <ol>
+     *   <li><b>提交后失效</b>：若在事务内删除缓存，并发读会拿到"尚未提交的 DB 快照"并回填，
+     *       制造出比目标竞态更早、更容易触发的脏数据窗口。故挂到 afterCommit。</li>
+     *   <li><b>保守失效</b>：不区分本次写入是否真的影响那 4 个统计项，一律失效。
+     *       统计接口面向 B 端仪表盘，多几次缓存重建的代价远低于漏失效导致的数据错误。</li>
+     * </ol>
+     */
+    private void evictTicketStatistics() {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    deleteTicketStatisticsKey();
+                }
+            });
+        } else {
+            deleteTicketStatisticsKey();
+        }
+    }
+
+    private void deleteTicketStatisticsKey() {
+        stringRedisTemplate.delete(RedisKeyConstants.ticketStatisticsKey(LocalDate.now()));
     }
 
     /**
