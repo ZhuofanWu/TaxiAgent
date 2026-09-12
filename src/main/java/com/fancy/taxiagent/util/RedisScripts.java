@@ -117,6 +117,43 @@ public final class RedisScripts {
             return 1
             """, Long.class);
 
+    /**
+     * 司机抢单原子预检（秒杀扣减库存模型）
+     * <p>
+     * 解决的竞态：原实现把"订单可抢"与"司机空闲"拆成两次独立的 DB 往返，
+     * 两次查询之间存在窗口 —— 同一司机的两个并发请求可能双双通过预检，
+     * 各自接下一单，最终一人持有两个进行中订单。
+     * <p>
+     * 把两个判断合并进一次 Lua，等于把它们放进同一个临界区：
+     * Redis 单线程执行脚本，不存在"判断完 A 再判断 B 时被插队"的可能。
+     * 判断通过后顺便占住司机位（设置 {@code driver:active}），把"检查"与"占位"
+     * 也变成一步 —— 否则两个请求可以同时通过检查、再先后占位。
+     * <p>
+     * 注意本脚本是<b>快速预检</b>而非最终裁决：DB 的乐观锁更新仍是唯一权威，
+     * 缓存与 DB 不一致时由调用方回滚 {@code driver:active}。
+     * <p>
+     * KEYS[1] = 订单状态 key（order:status:{orderId}）<br>
+     * KEYS[2] = 司机进行中订单 key（driver:active:{driverId}）<br>
+     * ARGV[1] = 可抢状态值（如 "10"）<br>
+     * ARGV[2] = 司机空闲哨兵<br>
+     * ARGV[3] = 本次抢单的 orderId（写入司机占位）<br>
+     * ARGV[4] = 司机占位 key 的过期秒数
+     *
+     * @return 1 = 抢单成功；-1 = 订单不可抢（状态不符）；-2 = 司机已有进行中订单或司机状态未预热
+     */
+    public static final RedisScript<Long> GRAB_ORDER_ATOMIC = script("""
+            local status = redis.call('GET', KEYS[1])
+            if status == false or status ~= ARGV[1] then
+                return -1
+            end
+            local active = redis.call('GET', KEYS[2])
+            if active == false or active ~= ARGV[2] then
+                return -2
+            end
+            redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])
+            return 1
+            """, Long.class);
+
     private static <T> RedisScript<T> script(String lua, Class<T> resultType) {
         DefaultRedisScript<T> redisScript = new DefaultRedisScript<>();
         redisScript.setScriptText(lua);

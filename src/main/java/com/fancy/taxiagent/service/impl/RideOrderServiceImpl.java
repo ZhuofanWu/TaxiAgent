@@ -7,6 +7,7 @@ import com.fancy.taxiagent.agentbase.amap.service.AmapRouteService;
 import com.fancy.taxiagent.domain.dto.CreateOrderDTO;
 import com.fancy.taxiagent.domain.entity.OrderRoute;
 import com.fancy.taxiagent.security.UserTokenContext;
+import com.fancy.taxiagent.service.base.OrderGrabService;
 import com.fancy.taxiagent.service.base.OrderRouteService;
 import com.fancy.taxiagent.domain.dto.Point;
 import com.fancy.taxiagent.domain.vo.RideOrderVO;
@@ -43,6 +44,7 @@ public class RideOrderServiceImpl implements RideOrderService {
     private final AmapRouteService amapRouteService;
     private final OrderRouteService orderRouteService;
     private final AmapGeoRegeoService amapGeoRegeoService;
+    private final OrderGrabService orderGrabService;
     private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
 
     @Override
@@ -264,6 +266,8 @@ public class RideOrderServiceImpl implements RideOrderService {
         if (order.getOrderId() == null) {
             throw new BusinessException(500, "订单创建失败");
         }
+        // 写透状态缓存：新单落入"待接单"，司机端的抢单预检无需回源 DB 即可判断
+        orderGrabService.syncOrderStatus(order.getOrderId().toString(), RideOrderStatus.CREATED.getCode());
         return order.getOrderId().toString();
     }
 
@@ -277,17 +281,15 @@ public class RideOrderServiceImpl implements RideOrderService {
         }
 
         Long driverIdLong = convertToLong(driverId);
-        Long activeCount = rideOrderMapper.selectCount(new LambdaQueryWrapper<RideOrder>()
-                .eq(RideOrder::getDriverId, driverIdLong)
-                .eq(RideOrder::getIsDeleted, 0)
-                .notIn(RideOrder::getOrderStatus, List.of(
-                        RideOrderStatus.FINISHED_WAIT_PAY.getCode(),
-                        RideOrderStatus.PAID.getCode(),
-                        RideOrderStatus.CANCELLED.getCode())));
-        if (activeCount != null && activeCount > 0) {
-            throw new BusinessException(409, "司机已有未结束订单，无法接单");
+
+        // 阶段一：Redis 原子预检（订单可抢 + 司机空闲），一次判断代替原先的两次 DB 往返。
+        // 校验与占位在同一次 Lua 中完成，并发请求不存在"双双通过预检"的窗口。
+        OrderGrabService.GrabResult grabResult = orderGrabService.tryGrab(orderId, driverId);
+        if (grabResult != OrderGrabService.GrabResult.SUCCESS) {
+            throw new BusinessException(409, grabFailureMessage(grabResult));
         }
 
+        // 阶段二：DB 乐观锁落库 —— 预检只是加速，DB 才是最终裁决者
         LocalDateTime now = LocalDateTime.now();
         int updated = rideOrderMapper.update(null,
                 new LambdaUpdateWrapper<RideOrder>()
@@ -300,7 +302,28 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .set(RideOrder::getDriverAcceptTime, now)
                         .set(RideOrder::getUpdateTime, now));
 
-        return updated > 0;
+        if (updated <= 0) {
+            // 预检通过但落库失败：缓存态与 DB 不一致（订单已被他人抢走/已取消）。
+            // 必须把 Lua 里占住的司机位还回去，否则该司机会被一个自己没接到的订单锁住。
+            orderGrabService.rollbackGrab(driverId, orderId);
+            orderGrabService.refreshOrderStatus(orderId);
+            return false;
+        }
+
+        orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
+        return true;
+    }
+
+    /**
+     * 抢单预检失败的用户提示
+     */
+    private String grabFailureMessage(OrderGrabService.GrabResult result) {
+        return switch (result) {
+            case ORDER_NOT_FOUND -> "订单不存在";
+            case DRIVER_BUSY -> "司机已有未结束订单，无法接单";
+            case ORDER_NOT_GRABBABLE -> "订单已被其他司机接走或已取消";
+            default -> "接单失败，请刷新后重试";
+        };
     }
 
     @Override
@@ -323,6 +346,9 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .set(RideOrder::getDriverArriveTime, now)
                         .set(RideOrder::getUpdateTime, now));
 
+        if (updated > 0) {
+            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ARRIVED.getCode());
+        }
         return updated > 0;
     }
 
@@ -346,6 +372,9 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .set(RideOrder::getPickupTime, now)
                         .set(RideOrder::getUpdateTime, now));
 
+        if (updated > 0) {
+            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.IN_TRIP.getCode());
+        }
         return updated > 0;
     }
 
@@ -470,6 +499,10 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new BusinessException(409, "订单状态已变化，请刷新后重试");
         }
 
+        orderGrabService.syncOrderStatus(orderId, RideOrderStatus.FINISHED_WAIT_PAY.getCode());
+        // 行程结束即释放司机：待支付订单不再占用司机，与"一人一单"的判定口径保持一致
+        orderGrabService.releaseDriver(driverId);
+
         return OrderBillVO.builder()
                 .orderId(orderId != null ? orderId.toString() : null)
                 .realPrice(realPrice)
@@ -497,6 +530,9 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .set(RideOrder::getPayTime, now)
                         .set(RideOrder::getUpdateTime, now));
 
+        if (updated > 0) {
+            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.PAID.getCode());
+        }
         return updated > 0;
     }
 
@@ -579,6 +615,14 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .set(RideOrder::getPriceDistance, BigDecimal.ZERO)
                         .set(RideOrder::getPriceExpedited, BigDecimal.ZERO)
                         .set(RideOrder::getUpdateTime, now));
+
+        if (updated > 0) {
+            orderGrabService.syncOrderStatus(orderId, RideOrderStatus.CANCELLED.getCode());
+            // 订单作废即释放司机，否则该司机将一直被这单锁在"忙"状态
+            if (order.getDriverId() != null) {
+                orderGrabService.releaseDriver(order.getDriverId().toString());
+            }
+        }
 
         return cancelFee.toPlainString();
     }

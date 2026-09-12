@@ -96,6 +96,18 @@ public final class RedisKeyConstants {
      */
     public static final String TICKET_STATISTICS_LOCK_PREFIX = "ticket:statistics:lock:";
 
+    /**
+     * 订单状态缓存 Key 前缀
+     * 完整格式: order:status:{orderId}
+     */
+    public static final String ORDER_STATUS_PREFIX = "order:status:";
+
+    /**
+     * 司机当前进行中订单 Key 前缀
+     * 完整格式: driver:active:{driverId}
+     */
+    public static final String DRIVER_ACTIVE_PREFIX = "driver:active:";
+
     private static final DateTimeFormatter DAY_KEY_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     /**
@@ -199,5 +211,19 @@ public final class RedisKeyConstants {
     public static String ticketStatisticsLockKey(LocalDate date) {
         LocalDate actualDate = date == null ? LocalDate.now() : date;
         return TICKET_STATISTICS_LOCK_PREFIX + actualDate.format(DAY_KEY_FORMATTER);
+    }
+
+    /**
+     * 构建订单状态缓存 Key
+     */
+    public static String orderStatusKey(String orderId) {
+        return ORDER_STATUS_PREFIX + orderId;
+    }
+
+    /**
+     * 构建司机当前进行中订单 Key
+     */
+    public static String driverActiveKey(String driverId) {
+        return DRIVER_ACTIVE_PREFIX + driverId;
     }
 }
