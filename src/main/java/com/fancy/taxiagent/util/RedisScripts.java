@@ -188,6 +188,42 @@ public final class RedisScripts {
             return limit - used - 1
             """, Long.class);
 
+    /**
+     * 判定司机是否在线，并把离线司机从位置池中清干净
+     * <p>
+     * 司机在线状态由"心跳时间戳是否新鲜"决定，而位置存在 `driver:geo:online` 这个
+     * <b>共享</b> GEO 结构里。因为共享 key 不能设 TTL，成员级的失效必须靠这里逐成员判定；
+     * 一旦判定为离线，就必须同时把位置成员摘掉，否则会留下孤儿成员。
+     * <p>
+     * 之所以要合并成一次 Lua：判定与清理若拆成两次调用，中间失败就会留下
+     * "心跳已删、位置还在"的残留 —— 而该 GEO key 没有 TTL 兜底，这份残留会<b>永久</b>存在，
+     * 让一个早已离线的司机一直留在在线池里。
+     * <p>
+     * KEYS[1] = 司机心跳 Hash（driver:online:beat）<br>
+     * KEYS[2] = 司机位置池 GEO（driver:geo:online）<br>
+     * ARGV[1] = driverId<br>
+     * ARGV[2] = 当前时间（毫秒）<br>
+     * ARGV[3] = 心跳有效期（毫秒）
+     *
+     * @return 1 = 在线；0 = 离线（本次已顺手清理）
+     */
+    public static final RedisScript<Long> CHECK_DRIVER_ONLINE = script("""
+            local beat = redis.call('HGET', KEYS[1], ARGV[1])
+            local online = false
+            if beat then
+                local beatNum = tonumber(beat)
+                if beatNum and (tonumber(ARGV[2]) - beatNum) <= tonumber(ARGV[3]) then
+                    online = true
+                end
+            end
+            if not online then
+                redis.call('HDEL', KEYS[1], ARGV[1])
+                redis.call('ZREM', KEYS[2], ARGV[1])
+                return 0
+            end
+            return 1
+            """, Long.class);
+
     private static <T> RedisScript<T> script(String lua, Class<T> resultType) {
         DefaultRedisScript<T> redisScript = new DefaultRedisScript<>();
         redisScript.setScriptText(lua);

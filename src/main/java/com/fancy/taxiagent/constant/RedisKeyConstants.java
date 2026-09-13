@@ -116,6 +116,50 @@ public final class RedisKeyConstants {
     public static final String DELAY_ORDER_TIMEOUT_KEY = "delay:order:timeout";
 
     /**
+     * 待接单订单地理位置池 Key（GEO，member = orderId）
+     * <p>
+     * 供司机端按距离查询附近订单。该 key 与工单池索引一样带整体 TTL：
+     * 订单离开"待接单"时会被成员级摘除，而统一 TTL 则是漏摘时的兜底，
+     * 让潜在漂移有界。整体过期后由下一个请求触发重建。
+     */
+    public static final String ORDER_GEO_POOL_KEY = "order:geo:pool";
+
+    /**
+     * 待接单订单地理池"已预热"标记 Key
+     * <p>
+     * 与工单池索引同理：GEO 底层是 ZSet，成员清空后 key 会被 Redis 自动删除，
+     * 于是"确实没有待接单订单"与"池还没建起来"在 EXISTS 上无法区分。
+     */
+    public static final String ORDER_GEO_POOL_READY_KEY = "order:geo:pool:ready";
+
+    /**
+     * 待接单订单地理池重建锁 Key
+     */
+    public static final String ORDER_GEO_POOL_REBUILD_LOCK_KEY = "order:geo:pool:rebuild:lock";
+
+    /**
+     * 司机在线位置池 Key（GEO，member = driverId）
+     * <p>
+     * <b>该 key 刻意不设过期</b>，这与上面订单池的做法刚好相反，原因是两者的失效粒度不同：
+     * Redis 的 {@code EXPIRE} 只能作用在 key 上，而这是一个全体司机共用的 key ——
+     * 一旦设置，任何一个司机的心跳都会刷新整个 key 的 TTL，于是只要池子里还有一个人在
+     * 心跳，离线司机的成员就永远不会被清除，池子只增不减。
+     * <p>
+     * 因此司机位置池的过期判定下沉到成员级，由 {@link #DRIVER_ONLINE_BEAT_KEY} 承担。
+     */
+    public static final String DRIVER_GEO_ONLINE_KEY = "driver:geo:online";
+
+    /**
+     * 司机最后心跳时间戳 Key（Hash，field = driverId，value = 最后心跳 epoch 毫秒）
+     * <p>
+     * 与 {@link #DRIVER_GEO_ONLINE_KEY} 配套，共同实现"成员级 TTL"：
+     * 因为共享 GEO key 无法整体过期，就把每个司机的存活期记在这里，读取时逐成员比对。
+     * 同样不设整体过期 —— 这份结构存在的意义正是成员级的存活判定，
+     * 整体过期会把它退回成与共享 TTL 一样的错误语义。
+     */
+    public static final String DRIVER_ONLINE_BEAT_KEY = "driver:online:beat";
+
+    /**
      * 对话分类结果缓存 Key 前缀
      * 完整格式: chat:classify:{上下文指纹}:{prompt指纹}
      */

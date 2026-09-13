@@ -200,12 +200,16 @@ public interface RideOrderService {
 
     /**
      * 获取司机工单池（未接单订单）
+     * <p>
+     * 以司机当前上报的位置为圆心按距离由近到远返回。司机未上线时返回空列表；
+     * 位置类缓存不可用时降级为按创建时间排序。
      *
-     * @param page 页码（从1开始）
-     * @param size 每页大小
+     * @param driverId 当前登录司机
+     * @param page     页码（从1开始）
+     * @param size     每页大小
      * @return 分页订单列表
      */
-    PageResult<RideOrderVO> getDriverOrderPool(Integer page, Integer size);
+    PageResult<RideOrderVO> getDriverOrderPool(String driverId, Integer page, Integer size);
 
     /**
      * 获取司机当前订单

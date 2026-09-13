@@ -9,6 +9,7 @@ import com.fancy.taxiagent.domain.vo.OrderBillVO;
 import com.fancy.taxiagent.domain.vo.PriceEstimateVO;
 import com.fancy.taxiagent.domain.vo.RideOrderVO;
 import com.fancy.taxiagent.security.UserTokenContext;
+import com.fancy.taxiagent.service.DriverLocationService;
 import com.fancy.taxiagent.service.RideOrderService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -35,6 +36,7 @@ import java.util.List;
 public class RideOrderController {
 
     private final RideOrderService rideOrderService;
+    private final DriverLocationService driverLocationService;
 
     // ==================== 乘客端接口 ====================
 
@@ -228,8 +230,54 @@ public class RideOrderController {
     @GetMapping("/driver/pool/page")
     @RequirePermission({"DRIVER"})
     public Result driverPool(@RequestParam Integer page, @RequestParam Integer size) {
-        PageResult<RideOrderVO> pool = rideOrderService.getDriverOrderPool(page, size);
+        Long driverId = UserTokenContext.getUserIdInLong();
+        PageResult<RideOrderVO> pool = rideOrderService.getDriverOrderPool(String.valueOf(driverId), page, size);
         return Result.ok(pool);
+    }
+
+    /**
+     * 司机上报当前位置（首次上线与心跳共用）
+     * <p>
+     * 前端在"上线"后按固定间隔重发同一坐标，后端据此维持在线状态；
+     * 超过心跳有效期未上报即视为离线。
+     *
+     * @param req 当前位置
+     * @return 是否上报成功
+     */
+    @PostMapping("/driver/location")
+    @RequirePermission({"DRIVER"})
+    public Result reportDriverLocation(@RequestBody DriverLocationReqDTO req) {
+        Long driverId = UserTokenContext.getUserIdInLong();
+        Boolean ok = driverLocationService.reportLocation(
+                String.valueOf(driverId), req.getLng(), req.getLat());
+        return Result.ok(ok);
+    }
+
+    /**
+     * 司机主动下线
+     *
+     * @return 是否下线成功
+     */
+    @PostMapping("/driver/offline")
+    @RequirePermission({"DRIVER"})
+    public Result driverOffline() {
+        Long driverId = UserTokenContext.getUserIdInLong();
+        Boolean ok = driverLocationService.goOffline(String.valueOf(driverId));
+        return Result.ok(ok);
+    }
+
+    /**
+     * 查询司机当前在线状态与位置
+     * <p>
+     * 供司机端页面加载时恢复开关状态与地图标记。
+     *
+     * @return 在线状态与位置
+     */
+    @GetMapping("/driver/location")
+    @RequirePermission({"DRIVER"})
+    public Result driverLocation() {
+        Long driverId = UserTokenContext.getUserIdInLong();
+        return Result.ok(driverLocationService.getStatus(String.valueOf(driverId)));
     }
 
     /**
@@ -311,6 +359,18 @@ public class RideOrderController {
         private String orderId;
         private BigDecimal currentLat;
         private BigDecimal currentLng;
+    }
+
+    /**
+     * 司机位置上报请求
+     */
+    @lombok.Data
+    @lombok.Builder
+    @lombok.NoArgsConstructor
+    @lombok.AllArgsConstructor
+    public static class DriverLocationReqDTO {
+        private BigDecimal lng;
+        private BigDecimal lat;
     }
 
     /**

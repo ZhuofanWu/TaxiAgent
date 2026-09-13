@@ -47,6 +47,13 @@ public class RideOrderVO {
 
     private BigDecimal estDistance;
     private BigDecimal realDistance;
+    /**
+     * 距司机的直线距离（公里）
+     * <p>
+     * 仅司机端"附近订单"查询会填充，来自 Redis 地理池的 GEOSEARCH 结果；
+     * 其他查询路径保持为 null。
+     */
+    private BigDecimal distanceKm;
     private BigDecimal estPrice;
     private BigDecimal realPrice;
     private BigDecimal priceBase;
